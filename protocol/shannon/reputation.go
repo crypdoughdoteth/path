@@ -194,17 +194,16 @@ func (p *Protocol) filterByReputation(
 		// Record score observation for histogram
 		reputationmetrics.RecordScoreObservation(string(serviceID), score.Value)
 
-		// Check if score is above threshold (using FilterByScore's logic inline for efficiency)
-		// The threshold is stored in the config, but we use MinThreshold from reputation package defaults
-		// since the service handles the comparison internally
-		if score.Value >= reputation.DefaultMinThreshold {
+		// Check if score is above the configured minimum threshold
+		minThreshold := p.getReputationMinThreshold()
+		if score.Value >= minThreshold {
 			filtered[addr] = ep
 			reputationmetrics.RecordEndpointAllowed(string(serviceID), endpointDomain)
 		} else {
 			logger.Debug().
 				Str("endpoint", string(addr)).
 				Float64("score", score.Value).
-				Float64("threshold", reputation.DefaultMinThreshold).
+				Float64("threshold", minThreshold).
 				Msg("Filtering out low-reputation endpoint")
 			reputationmetrics.RecordEndpointFiltered(string(serviceID), endpointDomain)
 		}
@@ -221,4 +220,131 @@ func extractEndpointDomain(url string, logger polylog.Logger) string {
 		return shannonmetrics.ErrDomain
 	}
 	return domain
+}
+
+// getEndpointScores retrieves reputation scores for all endpoints and returns them
+// as a map suitable for the TieredSelector.
+func (p *Protocol) getEndpointScores(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	endpoints map[protocol.EndpointAddr]endpoint,
+	_ polylog.Logger, // logger reserved for future debug logging
+) (map[reputation.EndpointKey]float64, error) {
+	// Build endpoint keys for batch lookup
+	keys := make([]reputation.EndpointKey, 0, len(endpoints))
+	for addr := range endpoints {
+		keys = append(keys, reputation.NewEndpointKey(serviceID, addr))
+	}
+
+	// Get scores from reputation service
+	scores, err := p.reputationService.GetScores(ctx, keys)
+	if err != nil {
+		reputationmetrics.RecordError("get_scores", "storage_error")
+		return nil, err
+	}
+
+	// Convert to score values map
+	result := make(map[reputation.EndpointKey]float64, len(endpoints))
+	for addr := range endpoints {
+		key := reputation.NewEndpointKey(serviceID, addr)
+		if score, exists := scores[key]; exists {
+			result[key] = score.Value
+		} else {
+			// New endpoints get initial score
+			result[key] = reputation.InitialScore
+		}
+	}
+
+	return result, nil
+}
+
+// getReputationMinThreshold returns the configured minimum reputation threshold.
+// Falls back to default if tiered selector is not configured.
+func (p *Protocol) getReputationMinThreshold() float64 {
+	if p.tieredSelector != nil {
+		return p.tieredSelector.MinThreshold()
+	}
+	return reputation.DefaultMinThreshold
+}
+
+// filterToHighestTier filters endpoints to only return those from the highest available tier.
+// This implements the cascade-down selection: if Tier 1 has endpoints, only return Tier 1.
+// If Tier 1 is empty, return Tier 2. If both are empty, return Tier 3.
+// This allows the QoS layer to still do its validation and selection, but only within the best tier.
+func (p *Protocol) filterToHighestTier(
+	ctx context.Context,
+	serviceID protocol.ServiceID,
+	endpoints map[protocol.EndpointAddr]endpoint,
+	logger polylog.Logger,
+) map[protocol.EndpointAddr]endpoint {
+	if len(endpoints) == 0 {
+		return endpoints
+	}
+
+	// Get scores for all endpoints
+	endpointScores, err := p.getEndpointScores(ctx, serviceID, endpoints, logger)
+	if err != nil {
+		logger.Warn().Err(err).Msg("Failed to get endpoint scores for tiered filtering, returning all endpoints")
+		return endpoints
+	}
+
+	// Group endpoints by tier
+	tier1, tier2, tier3 := p.tieredSelector.GroupByTier(endpointScores)
+	tier1Count, tier2Count, tier3Count := len(tier1), len(tier2), len(tier3)
+
+	// Record tier distribution metrics (gauge showing current state)
+	reputationmetrics.RecordTierDistribution(string(serviceID), tier1Count, tier2Count, tier3Count)
+
+	// Log detailed tier distribution for observability
+	logger.Info().
+		Int("tier1_count", tier1Count).
+		Int("tier2_count", tier2Count).
+		Int("tier3_count", tier3Count).
+		Int("total_endpoints", len(endpoints)).
+		Float64("tier1_threshold", p.tieredSelector.Config().Tier1Threshold).
+		Float64("tier2_threshold", p.tieredSelector.Config().Tier2Threshold).
+		Float64("min_threshold", p.tieredSelector.MinThreshold()).
+		Msg("Tiered selection: endpoint distribution across tiers")
+
+	// Determine which tier to use and record metric
+	var selectedTier int
+	var selectedKeys []reputation.EndpointKey
+
+	switch {
+	case tier1Count > 0:
+		selectedTier = 1
+		selectedKeys = tier1
+	case tier2Count > 0:
+		selectedTier = 2
+		selectedKeys = tier2
+	case tier3Count > 0:
+		selectedTier = 3
+		selectedKeys = tier3
+	default:
+		// No endpoints in any tier (all below threshold) - return empty
+		logger.Warn().Msg("No endpoints available in any tier after tiered filtering")
+		reputationmetrics.RecordTierSelection(string(serviceID), 0)
+		return make(map[protocol.EndpointAddr]endpoint)
+	}
+
+	// Record the tier selection metric (counter for selections)
+	reputationmetrics.RecordTierSelection(string(serviceID), selectedTier)
+
+	// Build result map with only endpoints from the selected tier
+	result := make(map[protocol.EndpointAddr]endpoint, len(selectedKeys))
+	for _, key := range selectedKeys {
+		if ep, exists := endpoints[key.EndpointAddr]; exists {
+			result[key.EndpointAddr] = ep
+		}
+	}
+
+	logger.Info().
+		Int("selected_tier", selectedTier).
+		Int("endpoints_in_selected_tier", len(result)).
+		Int("tier1_available", tier1Count).
+		Int("tier2_available", tier2Count).
+		Int("tier3_available", tier3Count).
+		Msg("Tiered selection: returning endpoints from highest available tier")
+
+	return result
 }
